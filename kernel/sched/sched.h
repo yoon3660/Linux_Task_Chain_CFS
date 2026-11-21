@@ -2447,6 +2447,43 @@ extern void check_preempt_curr(struct rq *rq, struct task_struct *p, int flags);
 extern const_debug unsigned int sysctl_sched_nr_migrate;
 extern const_debug unsigned int sysctl_sched_migration_cost;
 
+/*
+ * Task chain awareness (sched_set_chain)
+ */
+#define CHAIN_STAGE_MAX		16
+#define CHAIN_LAT_MIN_NS	100000ULL	/* 100us */
+
+#define SCHED_CHAIN_POLICY_A	0x1	/* wakeup preemption credit */
+#define SCHED_CHAIN_POLICY_B	0x2	/* handoff placement */
+
+extern unsigned int sysctl_sched_chain_policy;
+extern unsigned int sysctl_sched_chain_min_interval_ns;
+extern unsigned int sysctl_sched_latency;
+
+struct sched_chain_stats {
+	u64 credit_issued;
+	u64 credit_preempt;
+	u64 credit_consumed;
+	u64 credit_expired;
+	u64 credit_skip_cgroup;
+	u64 b_cond;
+	u64 b_applied;
+};
+DECLARE_PER_CPU(struct sched_chain_stats, sched_chain_stats);
+
+/* Bump one counter of /proc/sched_chain_stats on @cpu. */
+#define chain_stat_inc(cpu, field) \
+	(per_cpu(sched_chain_stats, (cpu)).field++)
+
+/* Is @waker the stage right before @wakee in the same chain? */
+static inline bool task_is_chain_successor(struct task_struct *waker,
+					   struct task_struct *wakee)
+{
+	return wakee->chain_id != 0 &&
+	       waker->chain_id == wakee->chain_id &&
+	       wakee->chain_stage == waker->chain_stage + 1;
+}
+
 #ifdef CONFIG_SCHED_DEBUG
 extern unsigned int sysctl_sched_latency;
 extern unsigned int sysctl_sched_min_granularity;

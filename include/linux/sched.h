@@ -786,6 +786,12 @@ struct task_struct {
 	unsigned int			rt_priority;
 
 	struct sched_entity		se;
+	/* Task chain hint (sched_set_chain) */
+	u32				chain_id;		/* 0 = not in a chain */
+	u8				chain_stage;		/* 1..CHAIN_STAGE_MAX, 0 if none */
+	u64				chain_lat_ns;		/* size of one credit (ns) */
+	u64				chain_credit_ns;	/* credit held (ns), 0 = none */
+	u64				chain_last_credit;	/* last grant time, ktime_get_ns() */
 	struct sched_rt_entity		rt;
 	struct sched_dl_entity		dl;
 	const struct sched_class	*sched_class;

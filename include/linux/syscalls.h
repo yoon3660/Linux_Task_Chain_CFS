@@ -1006,6 +1006,8 @@ asmlinkage long sys_finit_module(int fd, const char __user *uargs, int flags);
 asmlinkage long sys_sched_setattr(pid_t pid,
 					struct sched_attr __user *attr,
 					unsigned int flags);
+asmlinkage long sys_sched_set_chain(pid_t pid, unsigned int chain_id,
+				    unsigned int stage, u64 lat_ns);
 asmlinkage long sys_sched_getattr(pid_t pid,
 					struct sched_attr __user *attr,
 					unsigned int size,

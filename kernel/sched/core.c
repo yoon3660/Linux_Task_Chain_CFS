@@ -55,6 +55,8 @@
 #include <linux/nospec.h>
 #include <linux/perf_event_api.h>
 #include <linux/profile.h>
+#include <linux/proc_fs.h>
+#include <linux/seq_file.h>
 #include <linux/psi.h>
 #include <linux/rcuwait_api.h>
 #include <linux/sched/wake_q.h>
@@ -4395,6 +4397,11 @@ static void __sched_fork(unsigned long clone_flags, struct task_struct *p)
 	p->se.prev_sum_exec_runtime	= 0;
 	p->se.nr_migrations		= 0;
 	p->se.vruntime			= 0;
+	p->chain_id			= 0;
+	p->chain_stage			= 0;
+	p->chain_lat_ns			= 0;
+	p->chain_credit_ns		= 0;
+	p->chain_last_credit		= 0;
 	INIT_LIST_HEAD(&p->se.group_node);
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
@@ -4557,7 +4564,17 @@ static int sysctl_schedstats(struct ctl_table *table, int write, void *buffer,
 #endif /* CONFIG_PROC_SYSCTL */
 #endif /* CONFIG_SCHEDSTATS */
 
+/* bit0 = policy A (preemption credit), bit1 = policy B (handoff placement) */
+unsigned int sysctl_sched_chain_policy;
+/* minimum interval between two credits for one task */
+unsigned int sysctl_sched_chain_min_interval_ns = 50000000;	/* 50ms */
+
 #ifdef CONFIG_SYSCTL
+static unsigned int sched_chain_policy_min;
+static unsigned int sched_chain_policy_max = SCHED_CHAIN_POLICY_A | SCHED_CHAIN_POLICY_B;
+static unsigned int sched_chain_interval_min = 1000000;		/* 1ms */
+static unsigned int sched_chain_interval_max = 1000000000;	/* 1s */
+
 static struct ctl_table sched_core_sysctls[] = {
 #ifdef CONFIG_SCHEDSTATS
 	{
@@ -4593,6 +4610,24 @@ static struct ctl_table sched_core_sysctls[] = {
 		.proc_handler   = sysctl_sched_uclamp_handler,
 	},
 #endif /* CONFIG_UCLAMP_TASK */
+	{
+		.procname	= "sched_chain_policy",
+		.data		= &sysctl_sched_chain_policy,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_douintvec_minmax,
+		.extra1		= &sched_chain_policy_min,
+		.extra2		= &sched_chain_policy_max,
+	},
+	{
+		.procname	= "sched_chain_min_interval_ns",
+		.data		= &sysctl_sched_chain_min_interval_ns,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_douintvec_minmax,
+		.extra1		= &sched_chain_interval_min,
+		.extra2		= &sched_chain_interval_max,
+	},
 	{}
 };
 static int __init sched_core_sysctl_init(void)
@@ -8022,6 +8057,130 @@ SYSCALL_DEFINE3(sched_setattr, pid_t, pid, struct sched_attr __user *, uattr,
 
 	return retval;
 }
+
+/**
+ * sys_sched_set_chain - tell the scheduler that a task is a stage of a chain
+ * @pid: the task in question, 0 for the calling thread
+ * @chain_id: chain identifier, 0 removes the task from its chain
+ * @stage: position in the chain, 1..CHAIN_STAGE_MAX
+ * @lat_ns: size of the one-shot wakeup credit, in ns
+ *
+ * Return: 0 on success, an error code otherwise.
+ */
+SYSCALL_DEFINE4(sched_set_chain, pid_t, pid, unsigned int, chain_id,
+		unsigned int, stage, u64, lat_ns)
+{
+	struct task_struct *p;
+	unsigned long flags;
+	int retval = 0;
+
+	if (pid < 0)
+		return -EINVAL;
+
+	if (chain_id) {
+		if (stage < 1 || stage > CHAIN_STAGE_MAX)
+			return -EINVAL;
+		if (lat_ns < CHAIN_LAT_MIN_NS || lat_ns > sysctl_sched_latency)
+			return -EINVAL;
+	} else {
+		stage = 0;
+		lat_ns = 0;
+	}
+
+	rcu_read_lock();
+	p = find_process_by_pid(pid);
+	if (!p) {
+		rcu_read_unlock();
+		return -ESRCH;
+	}
+	get_task_struct(p);
+	rcu_read_unlock();
+
+	if (p != current && !capable(CAP_SYS_NICE)) {
+		retval = -EPERM;
+		goto out_put;
+	}
+
+	raw_spin_lock_irqsave(&p->pi_lock, flags);
+	p->chain_id		= chain_id;
+	p->chain_stage		= stage;
+	p->chain_lat_ns		= lat_ns;
+	p->chain_credit_ns	= 0;
+	p->chain_last_credit	= 0;
+	raw_spin_unlock_irqrestore(&p->pi_lock, flags);
+
+out_put:
+	put_task_struct(p);
+	return retval;
+}
+
+/*
+ * /proc/sched_chain_stats: per-CPU counters of the chain policies.
+ * Reading prints one header line and one line per CPU.
+ * Writing "0" clears every counter.
+ */
+DEFINE_PER_CPU(struct sched_chain_stats, sched_chain_stats);
+
+#ifdef CONFIG_PROC_FS
+static int sched_chain_stats_show(struct seq_file *m, void *v)
+{
+	int cpu;
+
+	seq_puts(m, "cpu credit_issued credit_preempt credit_consumed "
+		    "credit_expired credit_skip_cgroup b_cond b_applied\n");
+
+	for_each_online_cpu(cpu) {
+		struct sched_chain_stats *s = &per_cpu(sched_chain_stats, cpu);
+
+		seq_printf(m, "%d %llu %llu %llu %llu %llu %llu %llu\n", cpu,
+			   s->credit_issued, s->credit_preempt,
+			   s->credit_consumed, s->credit_expired,
+			   s->credit_skip_cgroup, s->b_cond, s->b_applied);
+	}
+	return 0;
+}
+
+static int sched_chain_stats_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, sched_chain_stats_show, NULL);
+}
+
+static ssize_t sched_chain_stats_write(struct file *file,
+				       const char __user *ubuf,
+				       size_t count, loff_t *ppos)
+{
+	unsigned int val;
+	int cpu, ret;
+
+	ret = kstrtouint_from_user(ubuf, count, 10, &val);
+	if (ret)
+		return ret;
+	if (val != 0)
+		return -EINVAL;
+
+	for_each_possible_cpu(cpu)
+		memset(&per_cpu(sched_chain_stats, cpu), 0,
+		       sizeof(struct sched_chain_stats));
+
+	return count;
+}
+
+static const struct proc_ops sched_chain_stats_proc_ops = {
+	.proc_open	= sched_chain_stats_open,
+	.proc_read	= seq_read,
+	.proc_write	= sched_chain_stats_write,
+	.proc_lseek	= seq_lseek,
+	.proc_release	= single_release,
+};
+
+static int __init sched_chain_stats_init(void)
+{
+	proc_create("sched_chain_stats", 0644, NULL,
+		    &sched_chain_stats_proc_ops);
+	return 0;
+}
+late_initcall(sched_chain_stats_init);
+#endif /* CONFIG_PROC_FS */
 
 /**
  * sys_sched_getscheduler - get the policy (scheduling class) of a thread

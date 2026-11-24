@@ -7469,6 +7469,31 @@ unlock:
 }
 
 /*
+ * A synchronous wakeup can hand the CPU to the next stage. The caller
+ * holds the wakee's pi_lock, so its CPU mask is stable here.
+ */
+static bool chain_handoff_cpu(struct task_struct *p, int cpu, int wake_flags)
+{
+	struct rq *rq = cpu_rq(cpu);
+
+	if (!(wake_flags & WF_SYNC) || !task_is_chain_successor_current(p) ||
+	    !cpumask_test_cpu(cpu, p->cpus_ptr) || !cpu_active(cpu))
+		return false;
+
+	/* Placement uses a snapshot of the waker CPU's runnable tasks. */
+	if (READ_ONCE(rq->cfs.h_nr_running) != 1 ||
+	    READ_ONCE(rq->rt.rt_nr_running) || READ_ONCE(rq->dl.dl_nr_running))
+		return false;
+
+	chain_stat_inc(b_cond);
+	if (!(READ_ONCE(sysctl_sched_chain_policy) & SCHED_CHAIN_POLICY_B))
+		return false;
+
+	chain_stat_inc(b_applied);
+	return true;
+}
+
+/*
  * select_task_rq_fair: Select target runqueue for the waking task in domains
  * that have the relevant SD flag set. In practice, this is SD_BALANCE_WAKE,
  * SD_BALANCE_FORK, or SD_BALANCE_EXEC.
@@ -7495,6 +7520,9 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
 	lockdep_assert_held(&p->pi_lock);
 	if (wake_flags & WF_TTWU) {
 		record_wakee(p);
+
+		if (chain_handoff_cpu(p, cpu, wake_flags))
+			return cpu;
 
 		if (sched_energy_enabled()) {
 			new_cpu = find_energy_efficient_cpu(p, prev_cpu);

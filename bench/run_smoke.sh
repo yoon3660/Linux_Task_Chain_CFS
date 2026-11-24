@@ -29,7 +29,7 @@ stats_sum() {
 }
 
 for load in ${LOADS:-0 "$LOAD"}; do
-	for policy in 0 1 3; do
+	for policy in ${POLICIES:-0 1 2 3}; do
 		sysctl -qw kernel.sched_chain_policy="$policy"
 		echo 0 > /proc/sched_chain_stats
 

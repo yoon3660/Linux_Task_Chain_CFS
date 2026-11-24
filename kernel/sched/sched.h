@@ -2509,6 +2509,12 @@ static inline bool task_is_chain_successor_current(struct task_struct *wakee)
 	return in_task() && task_is_chain_successor(current, wakee);
 }
 
+/* Is policy A (wakeup preemption credit) switched on? */
+static inline bool chain_policy_a(void)
+{
+	return READ_ONCE(sysctl_sched_chain_policy) & SCHED_CHAIN_POLICY_A;
+}
+
 #ifdef CONFIG_SCHED_DEBUG
 extern unsigned int sysctl_sched_latency;
 extern unsigned int sysctl_sched_min_granularity;

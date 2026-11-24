@@ -3,6 +3,7 @@
 #
 # usage: sudo ./run_smoke.sh [frames]      (default 300 frames = about 30 s per run)
 #        LOAD=12 sudo -E ./run_smoke.sh    (stress-ng workers, default = 2 x nproc)
+#        LOADS="12" sudo -E ./run_smoke.sh  (only these load levels; default "0 $LOAD")
 #
 # Needs: gcc, stress-ng, the iface + policy A kernel booted.
 set -e
@@ -27,7 +28,7 @@ stats_sum() {
 		/proc/sched_chain_stats
 }
 
-for load in 0 "$LOAD"; do
+for load in ${LOADS:-0 "$LOAD"}; do
 	for policy in 0 1 3; do
 		sysctl -qw kernel.sched_chain_policy="$policy"
 		echo 0 > /proc/sched_chain_stats
@@ -36,7 +37,9 @@ for load in 0 "$LOAD"; do
 		if [ "$load" -gt 0 ]; then
 			# periodic load (30 ms busy / 30 ms sleep): pure --cpu load never beats a
 			# chain task's sleeper bonus, so policy 0 and 1 would look identical
-			stress-ng --cpu "$load" --cpu-load 50 --cpu-load-slice 30 --quiet &
+			# setsid: stress-ng signals its whole process group when it exits,
+			# which would kill this script too if they shared one
+			setsid stress-ng --cpu "$load" --cpu-load 50 --cpu-load-slice 30 --quiet &
 			SP=$!
 			sleep 1
 		fi
@@ -45,7 +48,8 @@ for load in 0 "$LOAD"; do
 		./chain_smoke -n "$FRAMES"
 
 		if [ -n "$SP" ]; then
-			kill "$SP"
+			# SIGINT: stress-ng does not reliably stop its --cpu-load workers on SIGTERM
+			kill -INT -- -"$SP" 2>/dev/null || kill -INT "$SP"
 			wait "$SP" 2>/dev/null || true
 		fi
 		stats_sum

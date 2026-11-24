@@ -1,280 +1,116 @@
-# Linux_Task_Chain_CFS
+# Task Chain 인식 CFS 스케줄러 (Linux 6.1.192)
 
-# Task Chain 인식 CFS — 인터페이스 확정안 (iface-v1 초안)
+의존 관계 힌트 기반 wakeup 선점·배치 개선으로 파이프라인 워크로드(센서 → 인지 → 판단 → 제어)의 종단 간 꼬리 지연(p99)을 줄이는 커널 패치와 측정 도구.
+2026-2 리눅스 시스템 및 응용 텀 프로젝트.
 
-- 상태: **초안** → 11/21 회의에서 합의하면 이 문서와 스텁 커밋에 `iface-v1` 태그를 붙인다
-- 기준 문서: 제안서(25쪽), 설계 비교표(4쪽), 발표 슬라이드(17쪽)
-- 이 문서와 다른 문서가 다르면 **이 문서가 우선**한다. 바뀐 점은 맨 아래 "기존 문서와 달라진 점"에 모아 두었다.
+- 확정안(인터페이스 규격): [`docs/iface-v1.md`](docs/iface-v1.md) — 문서끼리 다르면 이 문서가 우선. 구현 중 달라진 점은 그 문서의 부록 2.
+- 커널 변경은 `kernel/sched/{core.c,fair.c,sched.h,debug.c}`, `include/linux/{sched.h,syscalls.h}`, `arch/x86/entry/syscalls/syscall_64.tbl`에만 있다. 나머지는 순정 v6.1.192.
 
----
+## 브랜치
 
-## 0. 공통 기준
-
-| 항목 | 확정 내용 |
-|---|---|
-| 커널 | `v6.1.___` (회의에서 kernel.org의 6.1.y 최신 태그 하나로 기입, 이후 변경 금지) |
-| .config | Ubuntu 22.04 config 상속 + `olddefconfig` + `CONFIG_SCHEDSTATS=y`, `CONFIG_SCHED_DEBUG=y`, `CONFIG_FTRACE=y`. 완성된 `.config`를 저장소 `configs/chain.config`로 커밋하고 모두 이 파일을 쓴다 |
-| 개발용 추가 옵션 | VM에서만 `CONFIG_DEBUG_PREEMPT=y`, `CONFIG_PROVE_LOCKING=y` (본체 측정 커널에는 넣지 않음) |
-| 저장소 | 커널 트리 1개. 브랜치: `main`(통합), `iface`(①), `policy-a`(②), `policy-b`(③). 벤치마크·스크립트는 같은 저장소의 `bench/` 디렉터리(④) |
-| 커널 이미지 | **측정용 이미지는 1개.** baseline / A / B / A+B는 sysctl로 전환한다 (2장) |
-| 순정 커널 | 패치 없는 `v6.1.___`도 한 번 빌드해 둔다. "정책 0 = 순정과 같음"을 hackbench로 1회 확인하는 용도 |
-
----
-
-## 1. 커널 내부 자료구조 (`include/linux/sched.h`)
-
-`struct task_struct` 안, `struct sched_entity se;` 바로 아래에 추가한다.
-
-```c
-	/* Task chain hint (sched_set_chain) */
-	u32	chain_id;           /* 0 = 체인 아님 */
-	u8	chain_stage;        /* 1..CHAIN_STAGE_MAX, 체인 아니면 0 */
-	u64	chain_lat_ns;       /* 1회 크레딧 크기 (ns) */
-	u64	chain_credit_ns;    /* 보유 크레딧 (ns), 0 = 없음 */
-	u64	chain_last_credit;  /* 마지막 발급 시각, ktime_get_ns() 기준 */
-```
-
-| 규칙 | 내용 |
-|---|---|
-| 필드 수 | **5개** (제안서의 "4개"는 오기) |
-| 상수 | `#define CHAIN_STAGE_MAX 16` |
-| 시계 | `chain_last_credit`의 기록과 비교는 모두 `ktime_get_ns()`로 한다 (CPU 사이에서 비교해도 안전한 단조 시계) |
-| 쓰기 위치 | `chain_credit_ns`, `chain_last_credit`는 `try_to_wake_up()`의 `p->pi_lock` 보유 구간 또는 해당 rq lock 보유 구간에서만 쓴다. 다른 곳에서 읽을 때는 `READ_ONCE()`를 쓴다 |
-| fork | `kernel/sched/core.c` `__sched_fork()`에서 5개 필드를 모두 0으로 초기화 (자식은 상속 안 함) |
-| exec | 유지 (초기화하지 않음) |
-| 단위 | 태스크(스레드) 단위. 멀티스레드 프로세스는 스레드마다 따로 설정 |
-
-### 공용 헬퍼 (`kernel/sched/sched.h`)
-
-```c
-/* waker가 wakee의 바로 앞 단계인가 */
-static inline bool task_is_chain_successor(struct task_struct *waker,
-					   struct task_struct *wakee)
-{
-	return wakee->chain_id != 0 &&
-	       waker->chain_id == wakee->chain_id &&
-	       wakee->chain_stage == waker->chain_stage + 1;
-}
-```
-
-②와 ③이 모두 이 헬퍼만 사용한다. 조건을 각자 따로 구현하지 않는다.
-
----
-
-## 2. 정책 스위치 (sysctl)
-
-| sysctl | 값 | 기본값 | 범위 |
-|---|---|---|---|
-| `kernel.sched_chain_policy` | 비트마스크: bit0 = 정책 A, bit1 = 정책 B | `0` | 0~3 (범위 밖이면 `-EINVAL`) |
-| `kernel.sched_chain_min_interval_ns` | 태스크당 크레딧 최소 발급 간격 | `50000000` (50ms) | 1,000,000 ~ 1,000,000,000 |
-
-| 값 | 비교군 |
-|---|---|
-| `0` | baseline (추가 코드는 첫 분기에서 빠져나감) |
-| `1` | A |
-| `2` | B만 (보조 실험) |
-| `3` | A+B |
-
-- 값을 바꾸면 **다음 wakeup부터** 적용된다. 이미 발급된 크레딧은 남아 있어도, bit0이 꺼져 있으면 선점 판정에서 쓰지 않는다.
-- 발급 간격 기본값을 50ms로 둔 이유: 체인 주기(100ms)와 같게 두면, 지터 때문에 실제 간격이 99.9ms가 된 프레임에서 크레딧이 발급되지 않는다.
-- 등록 위치: `kernel/sched/core.c`의 sysctl 테이블 (①이 담당). 값은 `READ_ONCE()`로 읽는다.
-
----
-
-## 3. 시스템 콜
-
-```c
-long sched_set_chain(pid_t pid, unsigned int chain_id,
-                     unsigned int stage, u64 lat_ns);
-```
-
-- 번호: **451** (`arch/x86/entry/syscalls/syscall_64.tbl`에 `451  common  sched_set_chain  sys_sched_set_chain`)
-- 선언: `include/linux/syscalls.h`, 구현: `kernel/sched/core.c`의 `SYSCALL_DEFINE4`
-
-| 상황 | 동작 / 반환 |
-|---|---|
-| `pid == 0` | 호출한 스레드 자신 |
-| `pid`가 다른 태스크 | `CAP_SYS_NICE` 필요, 없으면 `-EPERM` |
-| `pid` 없음 | `-ESRCH` |
-| `chain_id == 0` | 체인 해제. 5개 필드를 모두 0으로 (stage, lat_ns는 무시) |
-| `chain_id != 0`이고 stage가 1~16 밖 | `-EINVAL` |
-| `chain_id != 0`이고 `lat_ns`가 100,000(100µs) 미만 또는 `sysctl_sched_latency` 초과 | `-EINVAL` |
-| 정상 설정 | 0 반환. `chain_credit_ns = 0`, `chain_last_credit = 0`으로 초기화 |
-| 다시 호출 | 덮어쓰기 (위와 같이 크레딧 초기화) |
-| 패치 없는 커널 | 유저 쪽에 `-1` / `errno == ENOSYS`. 워크로드는 **경고만 찍고 baseline으로 계속 실행** |
-
-> `sysctl_sched_latency`는 코어 수에 따라 달라진다(6코어 계산상 약 18ms). 본체에서 `/sys/kernel/debug/sched/latency_ns`로 실제 값을 확인해 이 문서에 적는다: `____ ns`
-
-### 확인 방법: `/proc/<pid>/sched`
-
-`kernel/sched/debug.c` `proc_sched_show_task()`에 아래 3줄을 추가한다 (기존 출력 형식과 같은 `P()` 매크로 사용).
-
-```
-chain_id                                     :                    7
-chain_stage                                  :                    2
-chain_lat_ns                                 :              2000000
-```
-
----
-
-## 4. 통계 파일: `/proc/sched_chain_stats`
-
-- 기존 `/proc/schedstat`은 **건드리지 않는다** (형식 버전이 있어 perf 같은 도구가 파싱하므로).
-- per-CPU 카운터(`DEFINE_PER_CPU`). 틀(파일 생성, 출력, 초기화)은 ①이 만들고 값은 ②③이 올린다.
-- 읽기 형식 (공백 구분, 첫 줄 헤더 고정, CPU마다 한 줄):
-
-```
-cpu credit_issued credit_preempt credit_consumed credit_expired credit_skip_cgroup b_cond b_applied
-0 1203 980 910 3 0 12 10
-1 ...
-```
-
-| 열 | 담당 | 올리는 시점 |
+| 브랜치 | 내용 | 상태 |
 |---|---|---|
-| `credit_issued` | ② | ttwu에서 크레딧을 발급했을 때 (wakee가 큐잉될 CPU 기준) |
-| `credit_preempt` | ② | 크레딧이 없었으면 선점 안 됐는데 크레딧 덕분에 선점 판정이 1이 됐을 때 |
-| `credit_consumed` | ② | `set_next_entity()`에서 크레딧이 남은 태스크가 CPU를 잡아 크레딧을 0으로 만들 때 |
-| `credit_expired` | ② | 발급 후 `2 × chain_lat_ns`가 지나 쓰지 못하고 버려졌을 때 |
-| `credit_skip_cgroup` | ② | wakee와 현재 태스크가 다른 task group이라 크레딧을 무시했을 때 |
-| `b_cond` | ③ | 정책 B 조건(5.2절)을 모두 만족했을 때 (bit1이 꺼져 있어도 셈) |
-| `b_applied` | ③ | 실제로 waker CPU를 반환했을 때 |
+| `main` | 문서만 | |
+| `iface` | 순정 6.1.192 + 인터페이스 스텁(① 필드·시스템 콜·sysctl·통계 파일) + `bench/chain_test.c` | 스텁 완료 |
+| `policy-a` | `iface` + 정책 A(선점 크레딧) + `bench/chain_smoke.c`, `run_smoke.sh` | 구현 완료, 부팅 미확인 |
+| `policy-b` | `policy-a` + 정책 B(waker CPU 배치) | 구현 완료, 부팅 미확인 |
+| **`integ`** | `policy-b` + 리뷰 반영 패치 + 통합 수정 + 벤치마크 v2 | **측정용 통합본** |
 
-- 쓰기: `echo 0 > /proc/sched_chain_stats` → 전체 카운터 초기화 (root 전용). run.sh가 실행할 때마다 호출한다.
-- 열을 **추가**할 때는 맨 뒤에만 붙인다 (④의 파서는 헤더 이름으로 열을 찾는다).
-
----
-
-## 5. 정책 구현 시 지켜야 할 약속
-
-인터페이스는 아니지만 ②③이 서로의 코드를 깨지 않도록 미리 정한다.
-
-### 5.1 정책 A (②)
-
-| 항목 | 약속 |
-|---|---|
-| 발급 위치 | `try_to_wake_up()`, `p->pi_lock` 보유 구간, 큐잉 직전 |
-| 발급 조건 | `policy & 1` ∧ `in_task()` ∧ `task_is_chain_successor(current, p)` ∧ `now - p->chain_last_credit ≥ min_interval` |
-| 선점 판정 | **`wakeup_preempt_entity()`는 수정하지 않는다.** 크레딧을 인자로 받는 새 함수 `wakeup_preempt_entity_chain(curr_se, pse, credit_v)`를 만들어 `check_preempt_wakeup()`에서만 호출한다 (`pick_next_entity()`도 기존 함수를 부르므로, 기존 함수를 고치면 엉뚱한 태스크의 크레딧이 더해진다) |
-| 단위 변환 | `credit_v = calc_delta_fair(credit_ns, pse)` |
-| 오래된 크레딧 | 선점 판정 직전에 `now - chain_last_credit > 2 × chain_lat_ns`이면 크레딧을 0으로 만들고 `credit_expired`를 올린다 |
-| cgroup | `find_matching_se()` 후 **wakee와 현재 태스크가 같은 `cfs_rq`에 있는 태스크 entity일 때만** 크레딧을 쓴다. 아니면 `credit_skip_cgroup`을 올리고 기존 판정만 한다 |
-| 선점 성공 시 | `set_next_buddy(pse)` |
-| 소멸 | `set_next_entity()`에서 `chain_credit_ns = 0` |
-
-### 5.2 정책 B (③)
-
-| 항목 | 약속 |
-|---|---|
-| 위치 | `select_task_rq_fair()` 입구, `WF_TTWU`일 때만 |
-| 조건 | `task_is_chain_successor(current, p)` ∧ `WF_SYNC` ∧ waker CPU의 `cfs_rq->h_nr_running == 1` ∧ waker CPU의 rq에 RT/DL 태스크 없음 ∧ `cpumask_test_cpu(cpu, p->cpus_ptr)` ∧ `cpu_active(cpu)` |
-| 동작 | 조건을 만족하면 `b_cond`를 올린다. `policy & 2`이면 waker CPU를 반환하고 `b_applied`를 올린다 |
-| 첫 주 사전 측정 | baseline에서 후속 태스크가 이미 waker CPU에 놓이는 비율을 ftrace로 먼저 잰다 (6.1의 `wake_affine_idle()`이 비슷한 일을 이미 하므로) |
-
----
-
-## 6. 유저 공간 인터페이스 (④)
-
-### 6.1 헤더
-`bench/chain.h` — 시스템 콜 래퍼, sysctl·통계 파일 경로, 단계 간 토큰 구조체 (별도 파일 참조).
-
-### 6.2 단계 간 데이터 전달
-- **프레임(64KB)은 공유메모리**(`memfd_create` + `mmap`)의 슬롯 링에 둔다. 슬롯 수는 기본 8개.
-- **파이프로는 `struct chain_token`(24바이트)만 보낸다.** 파이프 기본 용량이 64KB라 프레임을 직접 쓰면 쓰기가 쪼개져 한 프레임에 wakeup이 여러 번 생기기 때문이다.
-- 각 단계는 받은 슬롯의 64KB 전체를 읽고, 연산하고, 다음 슬롯에 64KB를 쓴 뒤 토큰을 보낸다. 이렇게 해야 캐시 효과를 주장할 근거가 생긴다.
-
-### 6.3 실행 인자 (모든 단계 공통)
+`integ` 위에 쌓인 커밋(순정 이후):
 
 ```
-./chain_stage --role {sensor|perception|planning|control}
-              --chain-id 1 --stage N --lat-ns 2000000
-              --work-us 2000 --period-ms 100 --frames 3000
-              --out results/<run_id>/
+Import Linux v6.1.192 source
+sched: add task chain interface stub (iface-v1)
+bench: add chain_test for the iface-v1 interface
+sched/fair: add task chain policy A (one-shot wakeup preemption credit)
+sched/fair: hand off the waker CPU to the next chain stage
+sched: address review of the task chain interface stub
+sched: integrate policy A/B with the review fixes; add b_base_same
+docs/bench: project README, spec appendix 2, benchmark v2
 ```
 
-- 런처 `chain_run`이 4단계를 fork/exec하고 파이프와 memfd를 연결한다. 체인 프로세스와 stress-ng는 **같은 런처(같은 cgroup scope)에서** 시작한다.
-- 연산 시간(`--work-us`)은 터보 상태에서 보정한 바쁜 루프. 루프가 프레임 버퍼를 실제로 읽고 쓴다.
+## 동작 요약
 
-### 6.4 결과 파일
-
-`results/<run_id>/frames.csv` — control이 기록, 프레임당 한 줄:
-
-```
-frame,t_sensor_ns,perc_start_ns,perc_end_ns,plan_start_ns,plan_end_ns,ctrl_start_ns,ctrl_end_ns,e2e_ns,rd_perc_ns,rd_plan_ns,rd_ctrl_ns
-```
-
-- 시각은 모두 `CLOCK_MONOTONIC` ns.
-- `*_start_ns`는 토큰 `read()`가 돌아온 직후, `*_end_ns`는 다음 토큰 `write()` 직전.
-- `rd_*_ns`는 해당 단계의 `/proc/self/schedstat` 2번째 필드(run_delay)를 프레임 처리 전후로 읽은 **증가분**.
-- `e2e_ns = ctrl_end_ns - t_sensor_ns`.
-
-`results/<run_id>/meta.txt` — 실행마다 1개:
-
-```
-kernel=<uname -r>
-git_rev=<커널 커밋 해시>
-policy=<sched_chain_policy>
-min_interval_ns=<값>
-load=<0|6|12|24|mixed>
-rep=<1..5>
-governor=<cpufreq governor>
-chain_cgroup=<체인 프로세스의 /proc/<pid>/cgroup>
-load_cgroup=<stress-ng의 /proc/<pid>/cgroup>
-```
-
-`results/<run_id>/chain_stats_before.txt`, `chain_stats_after.txt` — `/proc/sched_chain_stats` 스냅샷.
-
----
-
-## 7. 일정과 산출물
-
-| 날짜 | 산출물 | 담당 |
-|---|---|---|
-| 11/21 | 이 문서 합의 → `iface-v1` | 전원 |
-| 11/22–23 | 스텁 커밋: 필드, 시스템 콜(검증 + 저장만), sysctl 2개, 0만 출력하는 통계 파일, `/proc/<pid>/sched` 출력 | ① |
-| 11/23 | baseline 재현 확인: 단계별 `rd_*_ns`가 부하에서 실제로 쌓이는가 | ④ |
-| 11/24 | ②③이 `iface-v1`에서 브랜치를 따서 구현 시작 | ②③ |
-| 11/26 | 스텁 → 완성본 (권한 검사, 경계값 테스트 프로그램 포함) | ① |
-
-### ① 스텁 완료 기준
-- [ ] `chain_test`(테스트 프로그램)가 정상값, 경계값, 범위 밖 값, 남의 pid(권한 없음), 없는 pid를 모두 확인하고 기대한 반환값을 받는다
-- [ ] `/proc/<pid>/sched`에 3줄이 보인다
-- [ ] fork한 자식의 `chain_id`가 0이다
-- [ ] sysctl 2개를 읽고 쓸 수 있고, 범위 밖 값은 거부된다
-- [ ] `/proc/sched_chain_stats`가 헤더와 CPU 6줄을 출력하고, `echo 0`으로 초기화된다
-- [ ] 정책 0에서 hackbench 결과가 순정 커널과 오차 범위 안이다
-
----
-
-## 8. 변경 규칙
-
-| 변경 종류 | 절차 |
-|---|---|
-| 추가 (통계 열을 맨 뒤에, CSV 열 추가, 새 sysctl) | 단톡방 공지 후 진행, 이 문서 갱신 |
-| 변경·삭제 (이름, 번호, 반환값, 열 순서, 기본값) | 전원 동의 → `iface-v2` 태그 |
-| 12/7 이후 | 데이터 확정 시점. 변경 금지 |
-
----
-
-## 9. 회의에서 확인할 것 (3가지)
-
-1. **정책 전환을 sysctl로 하는가?** (이 안: sysctl. 슬라이드의 "부팅 시 선택"은 발표 전에 "sysctl로 전환"으로 수정)
-2. **발급 간격 기본값을 50ms로 하는가?** (제안서·비교표는 100ms)
-3. **cgroup이 다르면 크레딧을 무시하는가?** (이 안: 비교표대로 무시 + `credit_skip_cgroup`으로 횟수 기록 + 런처에서 같은 scope 보장. 제안서 7.2의 "같은 깊이 entity에 적용"은 하지 않음)
-
----
-
-## 부록: 기존 문서와 달라진 점
-
-| 항목 | 기존 문서 | 이 확정안 | 이유 |
+| | 켜는 법 | 하는 일 | 바꾸는 곳 |
 |---|---|---|---|
-| 필드 수 | 제안서 "4개" | 5개 | 제안서 7.2에서도 `chain_last_credit` 사용 |
-| 정책 전환 | 브랜치 / 부팅 시 선택 | sysctl 비트마스크 | 이미지 1개로 빌드 차이 제거, 재부팅 없이 자동 측정 |
-| 발급 간격 이름·기본값 | `chain_min_interval_ns`, 100ms | `kernel.sched_chain_min_interval_ns`, 50ms | 주기 지터로 크레딧이 빠지는 문제 |
-| 오래된 크레딧 | 비교표에만 있음, 위치 미정 | 선점 판정 직전에 검사 | 구현 위치 명시 |
-| cgroup | 제안서 "적용", 비교표 "무시" | 무시 + 카운터 + 실행 절차로 같은 group 보장 | 범위를 단순하게, 무시된 횟수는 측정 |
-| 선점 판정 함수 | `wakeup_preempt_entity()` 수정 | 새 함수 `wakeup_preempt_entity_chain()` | `pick_next_entity()`도 기존 함수를 호출하므로 |
-| 정책 B 카운터 | `/proc/schedstat` | `/proc/sched_chain_stats` | 기존 파일 형식을 깨지 않기 위해 |
-| 정책 A 카운터 | 없음 | 5개 추가 | 1차 완료 기준(실제로 실행됐는가)을 숫자로 확인 |
-| 역할 ③ | C-state 유휴 코어 선택 포함 | 제외 | 제안서 7.3, 슬라이드와 맞춤 (future work) |
-| 프레임 전달 | 64KB를 파이프로 | 공유메모리 + 24바이트 토큰 | 파이프 용량 64KB라 쓰기가 쪼개져 wakeup이 여러 번 생김 |
-| 선점 문턱 설명 | "약 1ms" | 6코어 계산상 약 3ms (본체에서 확인) | 코어 수에 따른 자동 스케일링 |
+| 등록 | `sched_set_chain(pid, chain_id, stage, lat_ns)` (시스템 콜 451) | "이 태스크는 체인 N의 M단계" | `task_struct` 필드 5개 |
+| 정책 A | `kernel.sched_chain_policy` bit0 | 앞 단계가 다음 단계를 깨울 때 1회성 크레딧(`lat_ns`)을 주고, 선점 판정과 next-buddy 선택에서 그만큼 유리하게. CPU를 받으면 소멸, `2×lat_ns` 뒤 만료, 태스크당 `sched_chain_min_interval_ns`(기본 50ms)에 한 번 | `try_to_wake_up`, `check_preempt_wakeup`, `pick_next_entity`, `set_next_entity` |
+| 정책 B | bit1 | 동기 wakeup(WF_SYNC)이고 waker CPU에 runnable 일반 태스크가 waker뿐이면 다음 단계를 그 CPU에 배치 | `select_task_rq_fair` |
+| 통계 | `/proc/sched_chain_stats` | CPU별 카운터 9열, `echo 0 >`으로 초기화 | |
+
+vruntime(공정성 회계)은 어느 정책도 바꾸지 않는다. 정책 0이면 순정과 같은 판단을 한다.
+
+## 빌드·설치 (측정 PC, Ubuntu 24.04)
+
+순정 기준 커널 `6.1.192-vanilla`가 이미 설치되어 있다. **같은 이름으로 설치하면 덮어쓰므로 `LOCALVERSION`을 반드시 바꾼다.**
+
+```bash
+cd /srv/chain/linux && git checkout integ
+cp /boot/config-$(uname -r) .config
+./scripts/config --disable SYSTEM_TRUSTED_KEYS --disable SYSTEM_REVOCATION_KEYS \
+  --disable DEBUG_INFO --disable DEBUG_INFO_BTF \
+  --enable SCHEDSTATS --enable SCHED_DEBUG --enable FTRACE \
+  --set-str LOCALVERSION "-chain"
+make olddefconfig
+tmux new -s build            # 안에서:
+make -j$(nproc) 2>&1 | tee build.log
+
+# 설치·부팅은 관리자만 (docs/접속 매뉴얼의 사용 규칙)
+sudo make modules_install INSTALL_MOD_STRIP=1 && sudo make install && sudo update-grub
+ls /boot | grep 6.1.192                       # -vanilla 와 -chain 둘 다 있어야 함
+sudo grub-reboot "Advanced options for Ubuntu>Ubuntu, with Linux 6.1.192-chain"
+sudo reboot
+```
+
+완성된 `.config`는 `configs/chain.config`로 커밋한다 (TODO: 측정 PC에서 첫 빌드 후).
+
+VM에서 개발할 때는 `CONFIG_DEBUG_PREEMPT=y`, `CONFIG_PROVE_LOCKING=y`를 추가한다. 측정 커널에는 넣지 않는다.
+
+## 확인 순서
+
+```bash
+uname -r                                    # 6.1.192-chain
+cd bench
+gcc -O2 -Wall -o chain_test chain_test.c && sudo ./chain_test      # 전부 PASS
+sudo ./run_smoke.sh 300                     # policy 0 / 1 / 3, 부하 없음·있음
+cat /proc/sched_chain_stats                 # credit_issued, credit_preempt, b_cond 가 0이 아닌지
+```
+
+`chain_test`는 6.5 이상 커널에서는 451번이 `cachestat`이라 잘못된 결과를 낸다. 6.1 계열에서만 실행한다.
+
+## 본 측정 (`bench/chain_bench/`)
+
+4단계 체인(공유메모리 링 + 24바이트 토큰)을 KITTI 프레임으로 돌리고, 배경 부하 N × 반복 5회를 자동으로 수행한다. 자세한 사용법은 [`bench/chain_bench/README.md`](bench/chain_bench/README.md).
+
+```bash
+cd bench/chain_bench && make
+T="--cpu {N} --cpu-load 50 --cpu-load-slice 30"
+K=/srv/chain/data/kitti/rgb_0009
+# 기준 커널(-vanilla)에서 이미 완료: results_main/base10, base30
+# 통합 커널(-chain)에서:
+for P in 0 1 3; do
+  sudo -E OUT=results_main INPUT=kitti KITTI_DIR=$K LOAD_TEMPLATE="$T" LOADS="0 6 12 18" POLICY=$P ./run_matrix.sh p${P}_10
+  sudo -E OUT=results_main INPUT=kitti KITTI_DIR=$K LOAD_TEMPLATE="$T" LOADS="0 6 12 18" POLICY=$P PERIOD_MS=33 WORK_US=8000,6000,4000 ./run_matrix.sh p${P}_30
+done
+python3 analyze.py results_main
+```
+
+- 시나리오: 10fps(연산 2/1/0.5ms), 30fps(연산 8/6/4ms). 연산량(passes)은 기준 커널에서 한 번 보정해 `results_main/passes_*.txt`에 고정되어 있다. 지우지 않는다.
+- 지표: e2e p50/p99/max, 단계별 깨어난 뒤 대기(`wk_*`), 배경 부하 CPU·대기·공정성, `/proc/sched_chain_stats` 전후.
+- 비교: `p0_*`(정책 0)가 `base*`(순정)와 같은지 → 정책 0 = 순정 확인. `p1`(A), `p3`(A+B)를 `p0`과 비교.
+- 기준 커널 결과(2026-11-23): 10fps N=12에서 e2e p99 4.0 → 13.3ms(3.3배), 30fps N=12에서 18.9 → 38.6ms. 중앙값은 그대로, 깨어난 뒤 대기 p99 6~12ms.
+
+## 측정 PC 운영 규칙
+
+- 측정 중 다른 빌드·작업 금지 (`who`, `uptime`으로 확인, 단톡에 시작/끝 알림). 오래 걸리는 작업은 `tmux` 안에서.
+- 커널 설치·`update-grub`·재부팅·sysctl 정책 변경은 관리자만. `apt upgrade`, 펌웨어 업데이트 금지.
+- 자료는 `/srv/chain/` (커널 소스, 벤치마크, KITTI, 결과). 홈 폴더는 다른 계정이 읽을 수 없다.
+
+## 남은 일
+
+- [ ] `integ` 커널 VM·측정 PC 부팅 확인, `chain_test` 전부 PASS
+- [ ] `configs/chain.config` 커밋, `iface-v1` 태그
+- [ ] 통합 커널 본 측정(정책 0/1/3 × 2 시나리오 × N 4단계 × 5회, 정책당 약 2시간 20분)
+- [ ] 성능 저하 확인: hackbench, perf bench sched (순정 vs 정책 0 vs 정책 3)
+- [ ] 벤치마크 단계 수 옵션(제안서 2~6단계), 데모 스크립트(ftrace wakeup→switch)
+- [ ] `policy-b` 커밋 작성자 수정(`Codex` → 작성한 팀원)

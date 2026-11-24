@@ -8104,7 +8104,8 @@ SYSCALL_DEFINE4(sched_set_chain, pid_t, pid, unsigned int, chain_id,
 		unsigned int, stage, u64, lat_ns)
 {
 	struct task_struct *p;
-	unsigned long flags;
+	struct rq_flags rf;
+	struct rq *rq;
 	int retval = 0;
 
 	if (pid < 0)
@@ -8134,13 +8135,18 @@ SYSCALL_DEFINE4(sched_set_chain, pid_t, pid, unsigned int, chain_id,
 		goto out_put;
 	}
 
-	raw_spin_lock_irqsave(&p->pi_lock, flags);
-	p->chain_id		= chain_id;
-	p->chain_stage		= stage;
-	p->chain_lat_ns		= lat_ns;
+	/*
+	 * The credit fields are written by the wakeup path under p->pi_lock
+	 * and by the pick path under the rq lock, so take both here.
+	 * The other three are also read locklessly (READ_ONCE).
+	 */
+	rq = task_rq_lock(p, &rf);
+	WRITE_ONCE(p->chain_id, chain_id);
+	WRITE_ONCE(p->chain_stage, stage);
+	WRITE_ONCE(p->chain_lat_ns, lat_ns);
 	p->chain_credit_ns	= 0;
 	p->chain_last_credit	= 0;
-	raw_spin_unlock_irqrestore(&p->pi_lock, flags);
+	task_rq_unlock(rq, p, &rf);
 
 out_put:
 	put_task_struct(p);

@@ -2458,6 +2458,7 @@ extern const_debug unsigned int sysctl_sched_migration_cost;
 
 extern unsigned int sysctl_sched_chain_policy;
 extern unsigned int sysctl_sched_chain_min_interval_ns;
+/* Also declared below, but only under CONFIG_SCHED_DEBUG. */
 extern unsigned int sysctl_sched_latency;
 
 struct sched_chain_stats {
@@ -2471,17 +2472,41 @@ struct sched_chain_stats {
 };
 DECLARE_PER_CPU(struct sched_chain_stats, sched_chain_stats);
 
-/* Bump one counter of /proc/sched_chain_stats on @cpu. */
-#define chain_stat_inc(cpu, field) \
-	(per_cpu(sched_chain_stats, (cpu)).field++)
+/*
+ * Bump one counter of /proc/sched_chain_stats.
+ *
+ * Always counts on the CPU running this code: bumping another CPU's
+ * counter could race with that CPU and lose an update. Readers should
+ * use the sum over all CPUs.
+ */
+#define chain_stat_inc(field)	this_cpu_inc(sched_chain_stats.field)
 
-/* Is @waker the stage right before @wakee in the same chain? */
+/*
+ * Is @waker the stage right before @wakee in the same chain?
+ *
+ * The chain fields are read without holding either task's locks, and
+ * sched_set_chain() may change them from another CPU, hence READ_ONCE().
+ */
 static inline bool task_is_chain_successor(struct task_struct *waker,
 					   struct task_struct *wakee)
 {
-	return wakee->chain_id != 0 &&
-	       waker->chain_id == wakee->chain_id &&
-	       wakee->chain_stage == waker->chain_stage + 1;
+	u32 id = READ_ONCE(wakee->chain_id);
+
+	return id != 0 &&
+	       READ_ONCE(waker->chain_id) == id &&
+	       READ_ONCE(wakee->chain_stage) == READ_ONCE(waker->chain_stage) + 1;
+}
+
+/*
+ * Is @wakee being woken by the previous stage of its chain?
+ *
+ * For wakeup paths, where the waker is 'current'. A wakeup issued from
+ * interrupt or softirq context is not a handoff: 'current' is then just
+ * whatever task happened to be running.
+ */
+static inline bool task_is_chain_successor_current(struct task_struct *wakee)
+{
+	return in_task() && task_is_chain_successor(current, wakee);
 }
 
 /* Is policy A (wakeup preemption credit) switched on? */

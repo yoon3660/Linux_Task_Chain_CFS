@@ -30,7 +30,7 @@
 #define STATS_PATH	"/proc/sched_chain_stats"
 #define STATS_HEADER \
 	"cpu credit_issued credit_preempt credit_consumed credit_expired " \
-	"credit_skip_cgroup b_cond b_applied"
+	"credit_skip_cgroup b_cond b_applied b_base_same"
 
 static int n_pass, n_fail, n_skip;
 
@@ -263,21 +263,21 @@ static void test_stats(void)
 	}
 
 	for (line = strtok_r(buf, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
-		unsigned long long v[7];
+		unsigned long long v[8];
 		int cpu;
 
 		if (lines++ == 0) {
 			header_ok = !strcmp(line, STATS_HEADER);
 			continue;
 		}
-		if (sscanf(line, "%d %llu %llu %llu %llu %llu %llu %llu", &cpu,
-			   &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6]) != 8)
+		if (sscanf(line, "%d %llu %llu %llu %llu %llu %llu %llu %llu", &cpu,
+			   &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7]) != 9)
 			cols_ok = 0;
 	}
 	check(header_ok, "첫 줄 헤더가 README 와 같음");
 	check(lines - 1 == ncpu, "CPU 마다 한 줄");
 	printf("         CPU %ld개, 데이터 %d줄\n", ncpu, lines - 1);
-	check(cols_ok, "각 줄이 cpu + 숫자 7개");
+	check(cols_ok, "각 줄이 cpu + 숫자 8개");
 
 	if (geteuid() != 0) {
 		skip("통계 초기화 (root 로 실행해야 확인)");

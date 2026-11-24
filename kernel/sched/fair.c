@@ -4969,7 +4969,7 @@ set_next_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
 
 		if (unlikely(READ_ONCE(p->chain_credit_ns))) {
 			WRITE_ONCE(p->chain_credit_ns, 0);
-			chain_stat_inc(smp_processor_id(), credit_consumed);
+			chain_stat_inc(credit_consumed);
 		}
 	}
 
@@ -7469,29 +7469,38 @@ unlock:
 }
 
 /*
- * A synchronous wakeup can hand the CPU to the next stage. The caller
- * holds the wakee's pi_lock, so its CPU mask is stable here.
+ * Task chain policy B: a synchronous wakeup can hand the waker's CPU to the
+ * next stage. The caller holds the wakee's pi_lock, so its CPU mask is
+ * stable here. Returns:
+ *   CHAIN_B_NO     not a handoff (or the conditions do not hold)
+ *   CHAIN_B_COND   conditions hold but policy B is off: counted as b_cond
+ *                  so the baseline rate of the handoff case can be measured
+ *   CHAIN_B_APPLY  conditions hold and policy B is on: place @p on @cpu
+ *
+ * @cpu is the waker's CPU (this one). Only counts on the running CPU.
  */
-static bool chain_handoff_cpu(struct task_struct *p, int cpu, int wake_flags)
+enum { CHAIN_B_NO, CHAIN_B_COND, CHAIN_B_APPLY };
+
+static int chain_handoff_cpu(struct task_struct *p, int cpu, int wake_flags)
 {
 	struct rq *rq = cpu_rq(cpu);
 
-	if (!(wake_flags & WF_SYNC) || !in_task() ||
-	    !task_is_chain_successor(current, p) ||
+	if (!(wake_flags & WF_SYNC) ||
+	    !task_is_chain_successor_current(p) ||
 	    !cpumask_test_cpu(cpu, p->cpus_ptr) || !cpu_active(cpu))
-		return false;
+		return CHAIN_B_NO;
 
 	/* Placement uses a snapshot of the waker CPU's runnable tasks. */
 	if (READ_ONCE(rq->cfs.h_nr_running) != 1 ||
 	    READ_ONCE(rq->rt.rt_nr_running) || READ_ONCE(rq->dl.dl_nr_running))
-		return false;
+		return CHAIN_B_NO;
 
-	chain_stat_inc(cpu, b_cond);
+	chain_stat_inc(b_cond);
 	if (!(READ_ONCE(sysctl_sched_chain_policy) & SCHED_CHAIN_POLICY_B))
-		return false;
+		return CHAIN_B_COND;
 
-	chain_stat_inc(cpu, b_applied);
-	return true;
+	chain_stat_inc(b_applied);
+	return CHAIN_B_APPLY;
 }
 
 /*
@@ -7512,6 +7521,7 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
 	int cpu = smp_processor_id();
 	int new_cpu = prev_cpu;
 	int want_affine = 0;
+	int chain_b = CHAIN_B_NO;
 	/* SD_flags and WF_flags share the first nibble */
 	int sd_flag = wake_flags & 0xF;
 
@@ -7522,7 +7532,8 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
 	if (wake_flags & WF_TTWU) {
 		record_wakee(p);
 
-		if (chain_handoff_cpu(p, cpu, wake_flags))
+		chain_b = chain_handoff_cpu(p, cpu, wake_flags);
+		if (chain_b == CHAIN_B_APPLY)
 			return cpu;
 
 		if (sched_energy_enabled()) {
@@ -7569,6 +7580,10 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
 		new_cpu = select_idle_sibling(p, prev_cpu, new_cpu);
 	}
 	rcu_read_unlock();
+
+	/* Policy B baseline: did plain CFS already pick the waker CPU? */
+	if (chain_b == CHAIN_B_COND && new_cpu == cpu)
+		chain_stat_inc(b_base_same);
 
 	return new_cpu;
 }
@@ -7729,7 +7744,7 @@ static u64 chain_credit_v(struct sched_entity *se)
 	if (ktime_get_ns() - READ_ONCE(p->chain_last_credit) >
 	    2 * p->chain_lat_ns) {
 		WRITE_ONCE(p->chain_credit_ns, 0);
-		chain_stat_inc(smp_processor_id(), credit_expired);
+		chain_stat_inc(credit_expired);
 		return 0;
 	}
 
@@ -7845,12 +7860,12 @@ static void check_preempt_wakeup(struct rq *rq, struct task_struct *p, int wake_
 		if (pse == &p->se && se == &curr->se)
 			credit_v = chain_credit_v(pse);
 		else
-			chain_stat_inc(smp_processor_id(), credit_skip_cgroup);
+			chain_stat_inc(credit_skip_cgroup);
 	}
 
 	if (wakeup_preempt_entity_chain(se, pse, credit_v) == 1) {
 		if (credit_v && wakeup_preempt_entity(se, pse) != 1)
-			chain_stat_inc(smp_processor_id(), credit_preempt);
+			chain_stat_inc(credit_preempt);
 		/*
 		 * Bias pick_next to pick the sched entity that is
 		 * triggering this preemption.

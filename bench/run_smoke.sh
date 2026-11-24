@@ -1,14 +1,14 @@
 #!/bin/bash
-# run_smoke.sh - policy 0 vs 1, without and with CPU load, on the chain kernel
+# run_smoke.sh - policy 0 / 1 (A) / 3 (A+B), without and with periodic load, on the chain kernel
 #
 # usage: sudo ./run_smoke.sh [frames]      (default 300 frames = about 30 s per run)
-#        LOAD=8 sudo -E ./run_smoke.sh     (stress-ng workers, default = nproc)
+#        LOAD=12 sudo -E ./run_smoke.sh    (stress-ng workers, default = 2 x nproc)
 #
 # Needs: gcc, stress-ng, the iface + policy A kernel booted.
 set -e
 
 FRAMES=${1:-300}
-LOAD=${LOAD:-$(nproc)}
+LOAD=${LOAD:-$(( 2 * $(nproc) ))}   # 2 x nproc: each worker is 50% busy
 cd "$(dirname "$0")"
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -28,13 +28,15 @@ stats_sum() {
 }
 
 for load in 0 "$LOAD"; do
-	for policy in 0 1; do
+	for policy in 0 1 3; do
 		sysctl -qw kernel.sched_chain_policy="$policy"
 		echo 0 > /proc/sched_chain_stats
 
 		SP=
 		if [ "$load" -gt 0 ]; then
-			stress-ng --cpu "$load" --quiet &
+			# periodic load (30 ms busy / 30 ms sleep): pure --cpu load never beats a
+			# chain task's sleeper bonus, so policy 0 and 1 would look identical
+			stress-ng --cpu "$load" --cpu-load 50 --cpu-load-slice 30 --quiet &
 			SP=$!
 			sleep 1
 		fi

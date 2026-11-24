@@ -4068,7 +4068,7 @@ static inline void chain_grant_credit(struct task_struct *p)
 
 	if (!chain_policy_a())
 		return;
-	if (!in_task() || !task_is_chain_successor(current, p))
+	if (!task_is_chain_successor_current(p))
 		return;
 
 	now = ktime_get_ns();
@@ -4078,7 +4078,7 @@ static inline void chain_grant_credit(struct task_struct *p)
 
 	WRITE_ONCE(p->chain_credit_ns, p->chain_lat_ns);
 	WRITE_ONCE(p->chain_last_credit, now);
-	chain_stat_inc(smp_processor_id(), credit_issued);
+	chain_stat_inc(credit_issued);
 }
 
 /**
@@ -8166,15 +8166,16 @@ static int sched_chain_stats_show(struct seq_file *m, void *v)
 	int cpu;
 
 	seq_puts(m, "cpu credit_issued credit_preempt credit_consumed "
-		    "credit_expired credit_skip_cgroup b_cond b_applied\n");
+		    "credit_expired credit_skip_cgroup b_cond b_applied b_base_same\n");
 
 	for_each_online_cpu(cpu) {
 		struct sched_chain_stats *s = &per_cpu(sched_chain_stats, cpu);
 
-		seq_printf(m, "%d %llu %llu %llu %llu %llu %llu %llu\n", cpu,
+		seq_printf(m, "%d %llu %llu %llu %llu %llu %llu %llu %llu\n", cpu,
 			   s->credit_issued, s->credit_preempt,
 			   s->credit_consumed, s->credit_expired,
-			   s->credit_skip_cgroup, s->b_cond, s->b_applied);
+			   s->credit_skip_cgroup, s->b_cond, s->b_applied,
+			   s->b_base_same);
 	}
 	return 0;
 }

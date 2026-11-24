@@ -2469,6 +2469,7 @@ struct sched_chain_stats {
 	u64 credit_skip_cgroup;
 	u64 b_cond;
 	u64 b_applied;
+	u64 b_base_same;	/* b_cond cases where plain CFS chose the waker CPU */
 };
 DECLARE_PER_CPU(struct sched_chain_stats, sched_chain_stats);
 

@@ -150,7 +150,7 @@ static void run_stage(int stage, int in_fd, int out_fd, long frames,
 int main(int argc, char **argv)
 {
 	long frames = 300, period_ms = 100;
-	uint64_t lat_ns = 2000000;
+	uint64_t lat_ns = 4000000;	/* > wakeup_gran (3ms on 6 CPUs) */
 	int chain_id = 1, opt, out_fd;
 	int fds[NSTAGES - 1][2];
 	struct timespec next;

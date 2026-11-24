@@ -4051,6 +4051,36 @@ bool ttwu_state_match(struct task_struct *p, unsigned int state, int *success)
  * accesses to the task state; see try_to_wake_up() and set_current_state().
  */
 
+/*
+ * Task chain policy A: when @p is woken by the stage right before it in the
+ * same chain, give @p a one-shot preemption credit of p->chain_lat_ns.
+ * check_preempt_wakeup() and pick_next_entity() use it, set_next_entity()
+ * consumes it.
+ *
+ * Only task-context wakeups count (an interrupt is not a chain stage), and a
+ * task gets at most one credit per sysctl_sched_chain_min_interval_ns.
+ *
+ * Called with p->pi_lock held, before @p is put back on a runqueue.
+ */
+static inline void chain_grant_credit(struct task_struct *p)
+{
+	u64 now, last;
+
+	if (!chain_policy_a())
+		return;
+	if (!in_task() || !task_is_chain_successor(current, p))
+		return;
+
+	now = ktime_get_ns();
+	last = p->chain_last_credit;
+	if (last && now - last < READ_ONCE(sysctl_sched_chain_min_interval_ns))
+		return;
+
+	WRITE_ONCE(p->chain_credit_ns, p->chain_lat_ns);
+	WRITE_ONCE(p->chain_last_credit, now);
+	chain_stat_inc(smp_processor_id(), credit_issued);
+}
+
 /**
  * try_to_wake_up - wake up a thread
  * @p: the thread to be awakened
@@ -4128,6 +4158,9 @@ try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
 		goto unlock;
 
 	trace_sched_waking(p);
+
+	/* Before ttwu_runnable(): it can also call check_preempt_curr(). */
+	chain_grant_credit(p);
 
 	/*
 	 * Ensure we load p->on_rq _after_ p->state, otherwise it would

@@ -4963,6 +4963,16 @@ set_next_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
 	update_stats_curr_start(cfs_rq, se);
 	cfs_rq->curr = se;
 
+	/* Task chain policy A: the credit is spent once the task gets the CPU. */
+	if (entity_is_task(se)) {
+		struct task_struct *p = task_of(se);
+
+		if (unlikely(READ_ONCE(p->chain_credit_ns))) {
+			WRITE_ONCE(p->chain_credit_ns, 0);
+			chain_stat_inc(smp_processor_id(), credit_consumed);
+		}
+	}
+
 	/*
 	 * Track our maximum slice length, if the CPU's load is at
 	 * least twice that of our own weight (i.e. dont track it
@@ -4983,6 +4993,10 @@ set_next_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
 
 static int
 wakeup_preempt_entity(struct sched_entity *curr, struct sched_entity *se);
+static int
+wakeup_preempt_entity_chain(struct sched_entity *curr, struct sched_entity *se,
+			    s64 bias);
+static u64 chain_credit_v(struct sched_entity *se);
 
 /*
  * Pick the next process, keeping these things in mind, in this order:
@@ -5025,7 +5039,15 @@ pick_next_entity(struct cfs_rq *cfs_rq, struct sched_entity *curr)
 			se = second;
 	}
 
-	if (cfs_rq->next && wakeup_preempt_entity(cfs_rq->next, left) < 1) {
+	/*
+	 * Task chain policy A: a next buddy that holds a chain credit may be
+	 * ahead of the leftmost entity by up to the credit as well, so that the
+	 * successor nominated by check_preempt_wakeup() really runs next.
+	 * chain_credit_v() is 0 for every other entity.
+	 */
+	if (cfs_rq->next &&
+	    wakeup_preempt_entity_chain(cfs_rq->next, left,
+					-(s64)chain_credit_v(cfs_rq->next)) < 1) {
 		/*
 		 * Someone really wants this to run. If it's not unfair, run it.
 		 */
@@ -7629,6 +7651,62 @@ wakeup_preempt_entity(struct sched_entity *curr, struct sched_entity *se)
 	return 0;
 }
 
+/*
+ * Task chain policy A.
+ *
+ * Same as wakeup_preempt_entity(), with @bias (virtual time) added to the
+ * vruntime difference before any check, the vdiff <= 0 early return
+ * included. A positive bias favours @se, a negative one favours @curr.
+ * wakeup_preempt_entity() itself is left untouched because
+ * pick_next_entity() calls it with other entities in the @se slot.
+ */
+static int
+wakeup_preempt_entity_chain(struct sched_entity *curr, struct sched_entity *se,
+			    s64 bias)
+{
+	s64 gran, vdiff = curr->vruntime - se->vruntime + bias;
+
+	if (vdiff <= 0)
+		return -1;
+
+	gran = wakeup_gran(se);
+	if (vdiff > gran)
+		return 1;
+
+	return 0;
+}
+
+/*
+ * Task chain policy A: the usable credit of the task behind @se, converted
+ * to @se's virtual time, or 0 if @se is a group entity, holds no credit or
+ * policy A is off. A credit older than 2 * chain_lat_ns is dropped here and
+ * counted as expired.
+ *
+ * Called with the rq lock of @se held.
+ */
+static u64 chain_credit_v(struct sched_entity *se)
+{
+	struct task_struct *p;
+	u64 credit;
+
+	if (!entity_is_task(se))
+		return 0;
+
+	p = task_of(se);
+	credit = READ_ONCE(p->chain_credit_ns);
+	if (likely(!credit) || !chain_policy_a())
+		return 0;
+
+	if (ktime_get_ns() - READ_ONCE(p->chain_last_credit) >
+	    2 * p->chain_lat_ns) {
+		WRITE_ONCE(p->chain_credit_ns, 0);
+		chain_stat_inc(smp_processor_id(), credit_expired);
+		return 0;
+	}
+
+	return calc_delta_fair(credit, se);
+}
+
 static void set_last_buddy(struct sched_entity *se)
 {
 	for_each_sched_entity(se) {
@@ -7668,6 +7746,7 @@ static void check_preempt_wakeup(struct rq *rq, struct task_struct *p, int wake_
 	int scale = cfs_rq->nr_running >= sched_nr_latency;
 	int next_buddy_marked = 0;
 	int cse_is_idle, pse_is_idle;
+	u64 credit_v = 0;
 
 	if (unlikely(se == pse))
 		return;
@@ -7727,7 +7806,22 @@ static void check_preempt_wakeup(struct rq *rq, struct task_struct *p, int wake_
 		return;
 
 	update_curr(cfs_rq_of(se));
-	if (wakeup_preempt_entity(se, pse) == 1) {
+
+	/*
+	 * Task chain policy A: use the credit only when, after
+	 * find_matching_se(), both entities are still the tasks themselves,
+	 * i.e. p and curr sit on the same cfs_rq (same task group).
+	 */
+	if (unlikely(READ_ONCE(p->chain_credit_ns)) && chain_policy_a()) {
+		if (pse == &p->se && se == &curr->se)
+			credit_v = chain_credit_v(pse);
+		else
+			chain_stat_inc(smp_processor_id(), credit_skip_cgroup);
+	}
+
+	if (wakeup_preempt_entity_chain(se, pse, credit_v) == 1) {
+		if (credit_v && wakeup_preempt_entity(se, pse) != 1)
+			chain_stat_inc(smp_processor_id(), credit_preempt);
 		/*
 		 * Bias pick_next to pick the sched entity that is
 		 * triggering this preemption.

@@ -119,7 +119,8 @@ def plots(runs, summ, outdir):
     plt.rcParams.update({"font.size": 10, "axes.spines.top": False, "axes.spines.right": False,
                          "axes.unicode_minus": False})
     labels = list(dict.fromkeys(summ["label"]))
-    colors = dict(zip(labels, ["#4a5a6a", "#d1603d", "#2f8f83", "#8a63d2", "#c9a227"]))
+    palette = ["#4a5a6a", "#d1603d", "#2f8f83", "#8a63d2", "#c9a227", "#3b7dd8", "#b5495b", "#6b8e23"]
+    colors = {lab: palette[i % len(palette)] for i, lab in enumerate(labels)}
 
     # 1) 부하별 p99 e2e (막대 끝 = 반복 5회 범위)
     fig, ax = plt.subplots(figsize=(6.4, 4))
@@ -163,6 +164,48 @@ def plots(runs, summ, outdir):
     ax.set_xlabel("종단 간 지연 (ms)"); ax.set_ylabel("누적 비율"); ax.set_title(f"지연 분포 — 부하 {L}")
     ax.set_ylim(0.9, 1.001); ax.legend(frameon=False); fig.tight_layout()
     fig.savefig(os.path.join(outdir, "e2e_cdf_tail.png"), dpi=150)
+
+
+POLICY_NAME = {"p0": "정책 0 (기준)", "p1": "정책 1 (A)", "p2": "정책 2 (B)", "p3": "정책 3 (A+B)"}
+
+
+def policy_plots(summ, outdir):
+    """라벨이 p<정책>_<시나리오> 꼴이면 시나리오별로 정책 4개를 비교하는 그래프를 그린다."""
+    import matplotlib.pyplot as plt
+    pcol = {"p0": "#4a5a6a", "p1": "#d1603d", "p2": "#2f8f83", "p3": "#8a63d2"}
+    scen = {}
+    for lab in dict.fromkeys(summ["label"]):
+        if "_" in lab and lab.split("_")[0] in pcol:
+            p, sc = lab.split("_", 1)
+            scen.setdefault(sc, {})[p] = lab
+    for sc, pols in scen.items():
+        fig, ax = plt.subplots(figsize=(6.4, 4))
+        for p in sorted(pols):
+            s = summ[summ.label == pols[p]]
+            s = s[s["load"].map(lambda v: str(v).isdigit())]
+            x = [str(v) for v in s["load"]]
+            y = s["e2e_p99"].values
+            err = [y - s["e2e_p99_min"].values, s["e2e_p99_max"].values - y]
+            ax.errorbar(x, y, yerr=err, marker="o", capsize=3, label=POLICY_NAME[p], color=pcol[p])
+        ax.set_xlabel("배경 부하 N (주기형 작업 수, 각 CPU 50%)"); ax.set_ylabel("종단 간 지연 p99 (ms)")
+        ax.set_title(f"{sc.replace('10', '10fps').replace('30', '30fps')} — 정책별 p99 (점: 5회 중앙값, 막대: 범위)")
+        ax.set_ylim(bottom=0); ax.legend(frameon=False); fig.tight_layout()
+        fig.savefig(os.path.join(outdir, f"policy_p99_{sc}.png"), dpi=150)
+
+        # 공정성: 배경 작업 1개당 런큐 대기
+        if "bg_rd_ms_per_task" in summ.columns:
+            fig, ax = plt.subplots(figsize=(6.4, 4))
+            w = 0.8 / len(pols)
+            loads = sorted({int(v) for v in summ[summ.label.isin(pols.values())]["load"] if str(v).isdigit() and int(v) > 0})
+            for i, p in enumerate(sorted(pols)):
+                s = summ[summ.label == pols[p]].set_index("load")
+                ys = [s.loc[L, "bg_rd_ms_per_task"] / 1e3 if L in s.index else 0 for L in loads]
+                ax.bar(np.arange(len(loads)) + i * w, ys, w, label=POLICY_NAME[p], color=pcol[p])
+            ax.set_xticks(np.arange(len(loads)) + w * (len(pols) - 1) / 2, [f"N={L}" for L in loads])
+            ax.set_ylabel("배경 작업 1개당 런큐 대기 합계 (s / 5분)")
+            ax.set_title(f"{sc.replace('10', '10fps').replace('30', '30fps')} — 배경 부하가 치른 비용")
+            ax.legend(frameon=False); fig.tight_layout()
+            fig.savefig(os.path.join(outdir, f"policy_bgwait_{sc}.png"), dpi=150)
 
 
 def gonogo(runs):
@@ -212,13 +255,15 @@ def main():
     summ = summarize(runs)
     summ.to_csv(os.path.join(a.results, "summary.csv"), index=False)
     cols = ["label", "load", "reps", "e2e_p50", "e2e_p99", "e2e_p99_min", "e2e_p99_max", "e2e_max",
-            "wk_perc_p99_us", "wk_plan_p99_us", "wk_ctrl_p99_us", "bg_cpu_s_per_s", "bg_jain"]
+            "wk_perc_p99_us", "wk_plan_p99_us", "wk_ctrl_p99_us", "bg_cpu_s_per_s", "bg_rd_ms_per_task", "bg_jain"]
     with pd.option_context("display.width", 200, "display.max_columns", 30, "display.float_format", "{:.2f}".format):
         print(summ[[c for c in cols if c in summ.columns]].to_string(index=False))
     try:
         plots(runs, summ, a.results)
-        print("그래프:", ", ".join(os.path.join(a.results, f) for f in ("p99_vs_load.png", "stage_wait.png", "e2e_cdf_tail.png")))
+        policy_plots(summ, a.results)
+        print("그래프:", ", ".join(sorted(f for f in os.listdir(a.results) if f.endswith(".png"))))
     except Exception as e:
+        import traceback; traceback.print_exc()
         print("그래프 생략:", e)
 
 
